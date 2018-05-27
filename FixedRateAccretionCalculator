@@ -1,0 +1,417 @@
+public class FixedRateAccretionCalculator implements AccretionCalculator {
+
+	public void initialize( Trade           trade, 
+                            PricerInput     bondInput, 
+                            PricerMeasure[] pricerMeasures, 
+                            PricingEnv      env,
+                            Pricer          pricer, 
+                            JDatetime       valuationDateTime, 
+                            JDate           settleDate ) {
+		
+	}
+	
+	@Override
+	public void calculate( Trade           trade, 
+			               PricerInput     bondInput, 
+			               PricerMeasure[] pricerMeasures, 
+			               PricingEnv      env,
+			               Pricer          pricer, 
+			               JDatetime       valuationDateTime, 
+			               JDate           settleDate ) throws PricerException {
+		initialize( trade, bondInput, pricerMeasures, env, pricer, valuationDateTime, settleDate );
+		/*
+		 * Get the yield as of the trade date. If the yield is available in the trade ticket
+		 * then use that yield else compute the same.
+		 */
+		PricingEnv   cloneEnv    = env.shallowCloneNoParams();
+		Trade        clonedTrade = getClonedTrade( trade, trade.getSettleDate(), env, cloneEnv );
+		double       yieldAsOfTradeSettle = getYieldAsOfTradeSettle( clonedTrade, cloneEnv, trade.getTradeDate().getJDate( null ), pricer );
+		double       accretion = 0;
+		
+		/*
+		 * Get the trade settlement value less the accrual
+		 */
+        JDatetime        settleDateTime = new JDatetime( trade.getSettleDate(), 11, 50, 0, null );
+		double           settleDateNPV = computeNPVAsOfDate( clonedTrade, cloneEnv, pricer, settleDateTime, yieldAsOfTradeSettle, (PricerBondInput)bondInput, false );
+		
+		
+        for ( PricerMeasure msr : pricerMeasures ) {
+        	switch ( msr.getType() ) {
+	            case PricerMeasure.PREM_DISC_YIELD: {
+	            	accretion = calcAccretion( trade, env, pricer, valuationDateTime, yieldAsOfTradeSettle, settleDateNPV, (PricerBondInput)bondInput );
+	                msr.setValue( accretion );
+	                break;
+	            }
+        	}
+        	if ( PricerMeasureBond.S_PAA.equals( msr.getName() ) ) {
+            	double pAA = calcPAA( trade, env, pricer, valuationDateTime, yieldAsOfTradeSettle, settleDateNPV, bondInput );
+                msr.setValue( pAA );
+        	}
+        }
+	}
+	
+	protected double calcAccretion( Trade           trade, 
+            					    PricingEnv      env,
+            					    Pricer          pricer, 
+            					    JDatetime       asOfDateTime,
+            					    double          yield,
+            					    double          settleDateNPV,
+            					    PricerBondInput input ) throws PricerException {
+		
+		double       accretion = 0;
+		boolean      isHybridAmortization = isHybridCalculation( env, (Bond)trade.getProduct() );
+		
+		if ( !isHybridAmortization )
+			accretion = accretion( trade, env, pricer, asOfDateTime, yield, settleDateNPV, input );
+		else 
+			accretion = accretionUsingHybridAmortization( trade, env, pricer, asOfDateTime, yield, settleDateNPV, input );
+			
+		return accretion;
+	}
+	
+	protected double accretion( Trade           trade, 
+			                    PricingEnv      env,
+			                    Pricer          pricer, 
+			                    JDatetime       asOfDateTime,
+			                    double          yield,
+			                    double          settleDateNPV, 
+			                    PricerBondInput input ) throws PricerException {
+		
+		/*
+		 * For the given trade yield compute the value as of the valuation date without 
+		 * any prepayments. 
+		 */
+		JDate            valDate 	 = asOfDateTime.getJDate( null );
+		PricingEnv       cloneEnv    = env.shallowCloneNoParams();
+		Trade            clonedTrade = getClonedTrade( trade, valDate, env, cloneEnv );
+		double           valDateNPV  = computeNPVAsOfDate( clonedTrade, cloneEnv, pricer, asOfDateTime, yield, input, true );
+		
+		return valDateNPV - settleDateNPV;
+	}
+
+	protected double accretionUsingHybridAmortization( Trade           trade, 
+			                                           PricingEnv      env,
+			                                           Pricer          pricer, 
+			                                           JDatetime       asOfDateTime,
+			                                           double          yield,
+			                                           double          settleDateNPV,
+			                                           PricerBondInput input ) throws PricerException {
+        Bond        clonedBond = (Bond)trade.getProduct();
+        CashFlowSet cfs = null, interestFlows = new CashFlowSet();
+        JDate       date = asOfDateTime.getJDate(null);
+        JDate       firstDate = null, secondDate = null;
+        
+        try {
+			cfs = clonedBond.getFlows( trade.getSettleDate() );
+
+			cfs.find( CashFlow.INTEREST, interestFlows );
+
+			for (int count = 0; count < interestFlows.count(); count++) {
+				CashFlowInterest flow = (CashFlowInterest)interestFlows.get( count );
+				if ( flow.getEndDate().lte( trade.getSettleDate() ) ) 
+					continue;
+
+				if ( count < interestFlows.count() - 1 ) {
+					CashFlowInterest nextCpn = (CashFlowInterest) interestFlows.elementAt( count + 1 );
+					if ( flow.getEndDate().lte(date) && 
+						 date.lte( nextCpn.getEndDate() ) ) {
+						firstDate = flow.getEndDate();
+						secondDate = nextCpn.getEndDate();
+						break;
+					}
+				}
+			}
+			
+			if ( firstDate == null )  {
+				if(date.gte(trade.getSettleDate()) && interestFlows.size() > 0) {
+					firstDate = trade.getSettleDate();
+					secondDate = interestFlows.get(0).getEndDate();
+				} else 
+					return 0;
+			}
+			
+			JDatetime   firstDateTime   = new JDatetime( firstDate, 11, 50, 0, null );
+			JDatetime   secondDateTime = new JDatetime( secondDate, 11, 50, 0, null );
+			double      firstAccretion = accretion( trade, env, pricer, firstDateTime, yield, settleDateNPV, input );
+			double      secondAccretion = accretion( trade, env, pricer, secondDateTime, yield, settleDateNPV, input );
+			double      days = JDate.diff( firstDate, secondDate );
+			double      daysFromFirst = JDate.diff( firstDate, date );
+			
+			double      accretion = secondAccretion - ( days - daysFromFirst) /( days ) * ( secondAccretion - firstAccretion );
+			
+			return accretion;
+			
+		} catch (FlowGenerationException ex) {
+			throw new PricerException("Error while computing PremDiscYield using HybridAmortization true " +ex.getMessage() );
+		} 	
+	}
+	
+	/*
+	 * Payment Amortization Adjustment (PAA) represents the change in accretion/amortization 
+	 * due to a prepayment, which causes the expected future cashflows, and therefore present value,
+	 * to change.
+	 */
+	protected double calcPAA ( Trade           trade, 
+            				   PricingEnv      env,
+            				   Pricer          pricer, 
+            				   JDatetime       asOfDateTime,
+            				   double          yield,
+            				   double          settleDateNPV,
+            				   PricerInput     bondInput ) throws PricerException {
+		
+		double paa = 0.;
+		double premDiscYield = 0.;
+		double premDiscYieldPrev = 0.;
+		
+		PricingEnv   cloneEnv    = env.shallowCloneNoParams();
+		JDate        valDate     = asOfDateTime.getJDate( null );
+		Trade        clonedTrade = getClonedTrade( trade, valDate, env, cloneEnv );
+		
+		if( !checkIfCurrentAndPreviousPoolFactorExist( clonedTrade, asOfDateTime.getJDate( null ), (PricerBond)pricer, cloneEnv, (PricerBondInput)bondInput ) )
+			return 0.0;
+		
+		if (bondInput.getMeasures().findMeasure(PricerMeasure.S_PREM_DISC_YIELD) != null) {
+			premDiscYield =  bondInput.getMeasures().findMeasure(PricerMeasure.S_PREM_DISC_YIELD).getValue();
+		} else {
+			premDiscYield = calcAccretion( trade, env, pricer, asOfDateTime, yield, settleDateNPV, (PricerBondInput)bondInput );
+		}	
+		
+		ignoreLastKnowPoolFactor(clonedTrade, valDate);
+		
+		premDiscYieldPrev = calcAccretion( clonedTrade, cloneEnv, pricer, asOfDateTime, yield, settleDateNPV, (PricerBondInput)bondInput );
+		
+		paa = premDiscYield - premDiscYieldPrev;
+		
+		return paa;
+		
+	}
+	
+	protected double computeNPVAsOfDate( Trade           trade, 
+			                             PricingEnv      env,
+			                             Pricer          pricer, 
+			                             JDatetime       asOfDateTime,
+			                             double          yield,
+			                             PricerBondInput input,
+			                             boolean         includeIntermediatePayments ) throws PricerException {
+		double           intermediatePrincipal = 0.0;	
+		double           npv = computeNPV( trade, env, pricer, asOfDateTime, yield, input );
+		
+		CashFlowSet interestFlows = getInterestFlows(trade, asOfDateTime.getJDate( null ), (PricerBond)pricer, env, input);		
+		npv = adjustNotionalForProjectedPoolFactors(trade, asOfDateTime, interestFlows, npv, env);
+		
+		/* Add any principal payments from the trade settlement date 
+		 * to the valuation date to the valuation date NPV_NET
+		 */
+		if ( includeIntermediatePayments ) {
+			intermediatePrincipal = getPrincipalPayments( trade, asOfDateTime.getJDate( null ), env, ( PricerBond )pricer, input, interestFlows );
+			return npv + intermediatePrincipal;
+		}
+		
+		return npv;
+	}
+	
+	protected double computeNPV( Trade           trade, 
+                                 PricingEnv      env,
+                                 Pricer          pricer, 
+                                 JDatetime       asOfDateTime,
+                                 double          yield,
+                                 PricerBondInput input ) throws PricerException {
+		PricerMeasure[]  asOfDateMeasures = new PricerMeasure[1];
+		
+		asOfDateMeasures[0] = new PricerMeasure(PricerMeasure.NPV_NET);	
+		pricer.priceFromDriver( QuoteValue.YIELD, yield, trade, asOfDateTime, env, asOfDateMeasures );
+		
+		return asOfDateMeasures[0].getValue();
+	}
+	
+	protected double getYieldAsOfTradeSettle( Trade trade, PricingEnv env, JDate valDate, Pricer pricer ) throws PricerException {
+        double           origYield = 0.;
+        Bond             bond = (Bond)trade.getProduct();
+        PricerBond       bondPricer = (PricerBond)pricer;
+               
+        double tradePrice = bondPricer.getCleanPrice( trade, env );
+
+        if ( !Util.isEmpty(trade.getNegociatedPriceType() ) &&
+		     bond.isPriceBased()) {
+            tradePrice = tradePrice / bond.getFaceValue(trade.getSettleDate());
+        }
+
+        JDate settleDate = trade.getSettleDate();
+
+        origYield = bondPricer.computeYieldSettleDate( bond, trade, tradePrice, settleDate, settleDate, env );
+
+        return origYield;
+	}
+	
+	protected Trade getClonedTrade( Trade origTrade, JDate valDate, PricingEnv env, PricingEnv cloneEnv ) {
+        Bond   cloneBond  = null;
+        Trade  cloneTrade = null;
+        Bond   bondBAB    = (BondAssetBacked)origTrade.getProduct();
+        
+        try {
+        	/*
+        	 * Clone the bond and set the prepayments to zero.
+        	 */
+            cloneBond = (BondAssetBacked)bondBAB.clone();
+            cloneBond.setFlows(null);
+            cloneBond.setExternalCashFlowSource(null);
+            
+            QuoteSet   qsClone = (QuoteSet)env.getQuoteSet().clone();
+            cloneEnv.setQuoteSet( qsClone );
+
+            setQuoteValues( origTrade, valDate, cloneEnv );
+
+            cloneEnv.getParameters().setTransient(bondBAB.getType(), PricingParameters.NPV_INCLUDE_COST, Boolean.FALSE );
+            cloneEnv.getParameters().setTransient(bondBAB.getType(), PricingParameters.FORECAST_FROM_CURVE, Boolean.FALSE );
+            
+            cloneTrade = origTrade.clone();
+            cloneTrade.setProduct(cloneBond);
+        } catch (CloneNotSupportedException e) {
+            Log.error(this, e);
+            return null;
+        }
+
+        return cloneTrade;
+	}
+	
+	protected void setQuoteValues( Trade origTrade, JDate valDate, PricingEnv cloneEnv ) {
+        Bond   bondBAB = (BondAssetBacked)origTrade.getProduct();
+        
+        QuoteSet   qsClone = cloneEnv.getQuoteSet();
+        QuoteValue quote = new QuoteValue( cloneEnv.getQuoteSetName(), 
+        		                           bondBAB.getPrePaymentSpeedQuoteName(), 
+        		                           valDate,
+                                           QuoteValue.CLEAN_PRICE, 0, 0, 0, 0);
+
+        qsClone.handleNewQuote(quote, true);  
+        cloneEnv.setQuoteSet( qsClone );
+	}
+	
+	protected void ignoreLastKnowPoolFactor( Trade clonedTrade, JDate valDate ) {
+		BondAssetBacked   bondBAB = (BondAssetBacked)clonedTrade.getProduct();
+		PoolFactorEntry   poolFactorEntry = bondBAB.getPoolFactorEntry(valDate);
+		
+		if( poolFactorEntry != null  )
+			bondBAB.removePoolFactorEntry(poolFactorEntry.getEffectiveDate(), poolFactorEntry);
+	}
+	
+	protected double getPrincipalPayments( Trade trade, JDate valDate, PricingEnv env, PricerBond pricer, PricerBondInput input, CashFlowSet cfs ) throws PricerException {
+		Bond        clonedBond = (Bond)trade.getProduct();
+        double      intermediatePrincipal = 0.0;
+        CashFlowSet interestFlows = new CashFlowSet();
+        
+        if ( cfs == null ) {
+        	cfs = getInterestFlows(trade, valDate, (PricerBond)pricer, env, input);	
+        }
+        cfs.find( CashFlow.INTEREST, interestFlows );
+        
+        if( interestFlows.isEmpty() )
+        	return intermediatePrincipal;
+
+        double parNominal =  clonedBond.getParNominal(trade.getQuantity(), trade.getSettleDate());
+        double percentage = parNominal / clonedBond.getTotalIssued();
+
+        for (int count = 0; count < interestFlows.count(); count++) {
+        	CashFlowInterest flow = (CashFlowInterest)interestFlows.get( count );
+        	if ( flow.getEndDate().lte( trade.getSettleDate() ) ) 
+        		continue;
+
+        	if ( flow.getEndDate().after(valDate) )
+        		break;
+
+        	if ( flow.getEndDate().lte( valDate ) ) {
+        		// Calculate the principal amount as the difference between the flows.
+        		CashFlowInterest nextCpn = (CashFlowInterest) interestFlows.elementAt( count + 1 );
+        		if( nextCpn == null ) {
+        			intermediatePrincipal += flow.getExpectedNotional() * percentage;
+        		} else
+        			intermediatePrincipal += ( flow.getExpectedNotional() - nextCpn.getExpectedNotional() ) * percentage; 
+        	}
+        }
+        
+		return intermediatePrincipal;
+	}
+	
+	protected CashFlowSet getInterestFlows( Trade trade, JDate valDate, PricerBond pricer, PricingEnv env, PricerBondInput input ) throws PricerException {
+		Bond        clonedBond = (Bond)trade.getProduct();
+        CashFlowSet cfs = null, interestFlows = new CashFlowSet();
+        
+        try {       	
+        	cfs = clonedBond.getFlows();
+        	if ( cfs == null || cfs.isEmpty() )  
+        		cfs = clonedBond.generateFlows(valDate);
+
+        	JDate adjustedDate = pricer.getAdjustedDateForNotionalIndex( clonedBond, env, valDate, cfs );
+
+        	clonedBond.calculate( cfs, env, adjustedDate );
+        	pricer.forecastFlows( trade, cfs, env, valDate.getJDatetime(), input );
+
+			cfs.find( CashFlow.INTEREST, interestFlows );
+        } catch (FlowGenerationException e) {
+			throw new PricerException("Error while computing intermediate Principal "+e.getMessage());
+		}
+        
+        return interestFlows;
+	}
+
+	protected boolean doAdjustNotionalForProjectedPoolFactors() {
+		return true;
+	}
+	
+	//Adjust NPV_NET for projected factors
+	protected double adjustNotionalForProjectedPoolFactors( Trade trade, JDatetime valDatetime, CashFlowSet interestFlows, double npvNet, PricingEnv env ) {		
+		if ( !doAdjustNotionalForProjectedPoolFactors() )
+			return npvNet;
+		
+		JDate valDate    = valDatetime.getJDate( null );
+		JDate spotDate   = SpotDateCalculatorUtil.getSpotDate(trade, valDatetime);
+		JDate settleDate = trade.getSettleDate();
+		
+		Bond             clonedBond  = (Bond)trade.getProduct();
+		CashFlowInterest currentFlow = (CashFlowInterest) interestFlows.findEnclosingCoupon(valDate);
+		
+		if( trade.getSettleDate().after(valDate) ) 
+			return npvNet;
+		
+		if( currentFlow.getProjectedNotional() == 0 )
+			return npvNet;
+		
+		boolean spot = true;
+		boolean useTradeSettleB = env.getParameters().getBooleanValue( clonedBond.getType(), PricingParameters.USE_TRADE_SETTLE);
+        if ( ( spotDate.before(trade.getSettleDate()) || useTradeSettleB ) ) {
+            spot = false;
+        }       
+            
+        if ( spot ) {
+            settleDate = spotDate;
+        }
+        
+        if( env.getParameters().getAlternatePL(clonedBond.getType()) ) {
+        	settleDate = valDate;
+        }
+		
+		npvNet = npvNet * ( currentFlow.getProjectedNotional() / clonedBond.getTotalIssued() ) / clonedBond.getCurrentFactor(settleDate,true);
+		
+		return npvNet;
+	}
+	
+	protected boolean checkIfCurrentAndPreviousPoolFactorExist( Trade trade, JDate valDate, PricerBond pricer, PricingEnv env, PricerBondInput input ) throws PricerException {
+		
+		CashFlowSet interestFlows = getInterestFlows(trade, valDate, pricer, env, input);
+		
+		CashFlowInterest currentFlow  = (CashFlowInterest) interestFlows.findEnclosingCoupon(valDate);
+		CashFlowInterest previousFlow = (CashFlowInterest) interestFlows.findPreviousFlowByPaymentDate(CashFlow.INTEREST, currentFlow.getDate());
+		
+		if( previousFlow == null )
+			return false;
+		
+		return currentFlow.getProjectedNotional() == 0  && previousFlow.getProjectedNotional() == 0 ;
+	}
+	
+    protected boolean isHybridCalculation( PricingEnv env, Bond bond ) {
+        PricingParameters params = env.getParameters();
+
+        return ( params.getBooleanValue(bond.getType(),"HYBRID_AMORTIZATION") );
+    }
+	
+}
