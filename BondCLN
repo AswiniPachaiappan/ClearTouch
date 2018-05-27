@@ -1,0 +1,52 @@
+//CAL-288311 - OverRidden this method to return the correct currentFactor when one or more creditEvent is applied between the coupon periods.
+		 public double getCurrentFactor(JDate date,boolean useNotional) {
+
+			 double currentFactor = super.getCurrentFactor(date, useNotional);
+			 JDate dateToUse = null;
+
+			 JDate effMatDate = getEffectiveMaturityDate(date);
+			 if (effMatDate != null && date.gte(effMatDate)) {
+				 dateToUse = effMatDate.addDays(-1);
+			 } else {
+				 dateToUse = date;
+			 }
+
+
+			 try {
+				 Coupon cpn = (Coupon)getFlows(date).findEnclosingCoupon(dateToUse);
+
+				 double endDateLoss = getLosses(cpn.getEndDate());
+				 double currentLoss = getLosses(dateToUse);
+				 double currentNotional = 0.;
+				 
+				 // CAL-304834 In case of Amortizing bond The current factor is always expected to be 1. 
+				 //Amortizing bonds with credit event and current factor will be similar to non-Amortizing bonds with Credit event.
+				 //So to avoid the Amortizing amount affecting the current factor we consider the current factor as 1 and reduce only the credit event losses 
+				 //to compute current factor.
+				 if( getAmortizingB() && !getAmortizingFaceValueB() ){
+					 if( isCreditEventAffected( date ) ) {
+						 currentFactor = 1.;
+						 currentNotional = currentFactor * getTotalIssued();
+						 currentNotional = currentNotional - currentLoss;  
+					 } else
+						 return 1.;
+				 } else {
+					 currentNotional = currentFactor * getTotalIssued();
+				 }
+				 //CurrentFactor from bond is computed by end coupon notional so we are adding the end notional 
+				 //and subtracting the current notional to give the correct current factor for credit event
+				 
+
+				 if( !_protectionType.equals(COUPON_PROTECTED) && isCreditEventAffected( date )  ) {
+					 currentNotional = currentNotional + endDateLoss - currentLoss;
+				 }
+
+				 currentFactor  = currentNotional / getTotalIssued();
+
+			 } catch (Exception e) {
+				 Log.error(this, e);
+				 currentFactor = 1.0;
+			 }
+
+			 return currentFactor;
+		 }
